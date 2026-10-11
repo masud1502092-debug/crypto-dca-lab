@@ -22,19 +22,54 @@ with st.sidebar:
     days=int(st.number_input("কত দিনের data?",30,730,365,30))
     min_ex=st.slider("কমপক্ষে confirmed listing",0,5,2)
     cgkey=st.text_input("CoinGecko Demo API key (ঐচ্ছিক)",type="password")
+    if st.button("🔄 Exchange data আবার লোড করুন"):
+        find_host.clear(); load_one.clear(); exobj.clear(); st.rerun()
+
+# Streamlit Community Cloud runs in the US. Binance (HTTP 451) and Bybit (HTTP 403) block
+# their main domains from US IPs, so we probe alternative public-data hosts and use the first
+# one that answers. Binance entries are full base URLs; Bybit entries are ccxt "hostname" values.
+HOSTS={
+    "binance":["https://data-api.binance.vision","https://api.binance.vision","https://api1.binance.com","https://api2.binance.com","https://api3.binance.com","https://api4.binance.com","https://api.binance.com"],
+    "bybit":["bybit.com","bytick.com","bybit.nl"],
+}
+PING={"binance":lambda h:f"{h}/api/v3/ping","bybit":lambda h:f"https://api.{h}/v5/market/time"}
+
+@st.cache_data(ttl=600,show_spinner=False)
+def find_host(e):
+    """Return the first reachable host for exchange e, plus a log of every attempt."""
+    tried=[]
+    for h in HOSTS.get(e,[]):
+        try:
+            r=requests.get(PING[e](h),timeout=8)
+            code=r.status_code; ok=code==200
+        except Exception as x:
+            code=type(x).__name__; ok=False
+        tried.append(f"{h} → {code}")
+        if ok: return {"host":h,"tried":tried}
+    return {"host":None,"tried":tried}
 
 @st.cache_resource(ttl=600)
 def exobj(e):
+    # fetchMarkets types=["spot"]: by default ccxt also calls futures/option endpoints
+    # (e.g. fapi.binance.com, dapi.binance.com). If any one of those is blocked, the WHOLE
+    # load_markets() fails and the exchange shows as UNKNOWN. This app only needs spot.
     opts={"enableRateLimit":True,"timeout":20000,"options":{"defaultType":"spot"}}
-    if e=="binance":
-        opts["urls"]={"api":{"public":"https://api.binance.vision/api/v3","private":"https://api.binance.com/api/v3"}}
+    if e in ("binance","bybit"):
+        opts["options"]["fetchMarkets"]={"types":["spot"]}
+        h=find_host(e)["host"]
+        if h and e=="binance": opts["urls"]={"api":{"public":h+"/api/v3"}}
+        if h and e=="bybit": opts["hostname"]=h
     return getattr(ccxt,e)(opts)
 
 @st.cache_data(ttl=900,show_spinner=False)
+def load_one(e):
+    # Raises on failure, so Streamlit does not cache a failed load for 15 minutes.
+    return exobj(e).load_markets()
+
 def markets_load():
     good,err={},{}
     for e in EX:
-        try: good[e]=exobj(e).load_markets()
+        try: good[e]=load_one(e)
         except Exception as x: err[e]=f"{type(x).__name__}: {str(x)[:160]}"
     return good,err
 
@@ -218,9 +253,11 @@ with st.spinner("Exchange এবং market-cap ranking data আনা হচ্�
     mks,errors=markets_load()
     cgdf,cgerr=cg_top(cgkey)
 if errors:
-    with st.expander("⚠️ Exchange API status"):
-        for e,msg in errors.items():st.warning(f"{EN[e]}: {msg}")
-        st.info("Binance public API-তে api.binance.vision fallback চেষ্টা হয়। Bybit 403 বা Binance 451 যদি hosting region/network-এ block হয়, code তা নিশ্চিতভাবে bypass করতে পারে না। ওই exchange-এর listing UNKNOWN দেখানো হবে, ভুল করে NO নয়।")
+    with st.expander("⚠️ Exchange API status",expanded=True):
+        for e,msg in errors.items():
+            st.warning(f"{EN[e]}: {msg}")
+            if e in HOSTS: st.caption("চেষ্টা করা host: "+" | ".join(find_host(e)["tried"]))
+        st.info("Binance ও Bybit-এর বিকল্প public host চেষ্টা করা হয়েছে। সবগুলো block থাকলে সমস্যা hosting region-এর; Streamlit Community Cloud US-এ চলে। তখন listing UNKNOWN দেখানো হবে (ভুল করে NO নয়)। Tab 2-এর CoinGecko cross-check ব্যবহার করুন, বা অ্যাপটি EU/এশিয়া region-এর hosting-এ চালান।")
 if cgerr:st.warning("CoinGecko ranking data পাওয়া যায়নি: "+cgerr)
 coins=make_table(mks,cgdf)
 if coins.empty:st.error("Coin list পাওয়া যায়নি। API/network পরে আবার চেষ্টা করুন।");st.stop()
