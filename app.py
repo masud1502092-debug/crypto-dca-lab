@@ -66,12 +66,46 @@ def load_one(e):
     # Raises on failure, so Streamlit does not cache a failed load for 15 minutes.
     return exobj(e).load_markets()
 
-def markets_load():
-    good,err={},{}
+# Bybit blocks US IPs on every domain (CloudFront 403), so when its API is unreachable we read
+# its USDT spot listing from CoinGecko instead. This gives listing only, no price or candles.
+FB_ID={"bybit":"bybit_spot","binance":"binance"}
+
+def _cg_get(url,params,headers):
+    for attempt in range(4):
+        r=requests.get(url,params=params,headers=headers,timeout=20)
+        if r.status_code==429:
+            time.sleep(15*(attempt+1)); continue
+        r.raise_for_status(); return r.json()
+    raise RuntimeError("CoinGecko rate limit (429), কিছুক্ষণ পরে আবার চেষ্টা করুন")
+
+@st.cache_data(ttl=21600,show_spinner=False)
+def cg_exchange_markets(ex_id,key=""):
+    """USDT spot pairs of one exchange from CoinGecko. Raises on failure so errors are not cached."""
+    headers={"x-cg-demo-api-key":key} if key else {}
+    out={}
+    for page in range(1,26):
+        payload=_cg_get(f"{CG}/exchanges/{ex_id}/tickers",{"page":page},headers)
+        ticks=payload.get("tickers",[]) if isinstance(payload,dict) else []
+        for t in ticks:
+            base=str(t.get("base") or "").upper(); target=str(t.get("target") or "").upper()
+            if target!="USDT" or t.get("is_stale") or not base.isalnum() or len(base)>15: continue
+            sym=f"{base}/USDT"
+            out[sym]={"symbol":sym,"base":base,"quote":"USDT","spot":True,"active":True}
+        if len(ticks)<100: break
+        time.sleep(1.5)
+    if not out: raise RuntimeError("CoinGecko-তে কোনো USDT pair পাওয়া যায়নি")
+    return out
+
+def markets_load(cgkey=""):
+    good,err,fb={},{},set()
     for e in EX:
         try: good[e]=load_one(e)
-        except Exception as x: err[e]=f"{type(x).__name__}: {str(x)[:160]}"
-    return good,err
+        except Exception as x:
+            err[e]=f"{type(x).__name__}: {str(x)[:160]}"
+            if e in FB_ID:
+                try: good[e]=cg_exchange_markets(FB_ID[e],cgkey); fb.add(e)
+                except Exception as y: err[e]+=f" | CoinGecko fallback: {type(y).__name__}: {str(y)[:100]}"
+    return good,err,fb
 
 def pairs(mk):
     d={}
@@ -177,7 +211,7 @@ def make_table(mks,cgdf):
              "24h volume (USD)":c.get("total_volume"),"24h change (%)":c.get("price_change_percentage_24h"),
              "Layer":layer(coin,[]),"Confirmed listings":sum(coin in maps[e] for e in EX),
              "_cg_id":c.get("id")}
-        for e in EX: row[EN[e]]=("YES" if coin in maps[e] else "NO") if e in mks else "UNKNOWN"
+        for e in EX: row[EN[e]]=("YES" if coin in maps[e] else ("NO (CG)" if e in fb else "NO")) if e in mks else "UNKNOWN"
         out.append(row)
     d=pd.DataFrame(out)
     if not d.empty:
@@ -250,12 +284,13 @@ def score(coin,cg,cov,hist=None,s=None,cats=None):
     return total,rating,why,metrics
 
 with st.spinner("Exchange এবং market-cap ranking data আনা হচ্ছে..."):
-    mks,errors=markets_load()
+    mks,errors,fb=markets_load(cgkey)
     cgdf,cgerr=cg_top(cgkey)
 if errors:
     with st.expander("⚠️ Exchange API status",expanded=True):
         for e,msg in errors.items():
             st.warning(f"{EN[e]}: {msg}")
+            if e in fb: st.success(f"{EN[e]}: API block থাকায় CoinGecko থেকে USDT spot listing নেওয়া হয়েছে। শুধু listing দেখাবে; দাম ও backtest এই exchange থেকে হবে না।")
             if e in HOSTS: st.caption("চেষ্টা করা host: "+" | ".join(find_host(e)["tried"]))
         st.info("Binance ও Bybit-এর বিকল্প public host চেষ্টা করা হয়েছে। সবগুলো block থাকলে সমস্যা hosting region-এর; Streamlit Community Cloud US-এ চলে। তখন listing UNKNOWN দেখানো হবে (ভুল করে NO নয়)। Tab 2-এর CoinGecko cross-check ব্যবহার করুন, বা অ্যাপটি EU/এশিয়া region-এর hosting-এ চালান।")
 if cgerr:st.warning("CoinGecko ranking data পাওয়া যায়নি: "+cgerr)
@@ -303,7 +338,8 @@ with t2:
         for e in EX:
             pair=pairs(mks.get(e,{})).get(selected) if e in mks else None
             if e not in mks:rows.append({"Exchange":EN[e],"Listing":"UNKNOWN (API unavailable)","Pair":"—","Price":None,"24h change %":None,"24h volume":None})
-            elif not pair:rows.append({"Exchange":EN[e],"Listing":"NO","Pair":"—","Price":None,"24h change %":None,"24h volume":None})
+            elif e in fb and pair:rows.append({"Exchange":EN[e],"Listing":"YES (CoinGecko)","Pair":pair,"Price":None,"24h change %":None,"24h volume":None})
+            elif not pair:rows.append({"Exchange":EN[e],"Listing":"NO (CG)" if e in fb else "NO","Pair":"—","Price":None,"24h change %":None,"24h volume":None})
             else:
                 try:rows.append({"Exchange":EN[e],"Listing":"YES","Pair":pair,**ticker(e,pair)})
                 except Exception:rows.append({"Exchange":EN[e],"Listing":"YES, price API failed","Pair":pair,"Price":None,"24h change %":None,"24h volume":None})
@@ -343,7 +379,7 @@ with t3:
     if not choices:st.warning("কোনো working exchange-এ historical pair পাওয়া যায়নি।")
     else:
         coin=st.selectbox("Backtest coin",choices)
-        available=[e for e in EX if e in mks and coin in pairs(mks[e])]
+        available=[e for e in EX if e in mks and e not in fb and coin in pairs(mks[e])]
         if not available:st.warning("এই coin-এর জন্য working historical source নেই।")
         else:
             source=st.selectbox("Historical data source",available,format_func=lambda e:EN[e])
